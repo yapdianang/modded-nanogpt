@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -185,13 +186,17 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype))
 
 
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, depth):
         super().__init__()
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
+        self.head_dim = self.n_embd // self.n_head // 2
         assert self.n_embd % self.n_head == 0
         self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
@@ -202,13 +207,29 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5))  # @Grad62304977
 
+        self.lambda_init = lambda_init_fn(depth)
+        self.lambda_q1 = nn.Parameter(
+            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+        self.lambda_k1 = nn.Parameter(
+            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+        self.lambda_q2 = nn.Parameter(
+            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+        self.lambda_k2 = nn.Parameter(
+            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+
+        self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+
     def forward(self, x, v1=None):
         B, T, C = (
             x.size()
         )  # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x).view(B, T, 2 * self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, 2 * self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, 2 * self.head_dim)
         if v1 is None:
             v1 = v  # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v)  # @Grad62304977
@@ -217,13 +238,73 @@ class CausalSelfAttention(nn.Module):
             k, (k.size(-1),)
         )  # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
+        q1, q2 = q.chunk(2, dim=-2)
+        k1, k2 = k.chunk(2, dim=-2)
+        attn1 = F.scaled_dot_product_attention(
+            q1.transpose(1, 2), k1.transpose(1, 2), v.transpose(1, 2), is_causal=True
         )
+        attn2 = F.scaled_dot_product_attention(
+            q2.transpose(1, 2), k2.transpose(1, 2), v.transpose(1, 2), is_causal=True
+        )
+        lambda_1 = torch.exp(
+            torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()
+        ).type_as(q)
+        lambda_2 = torch.exp(
+            torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()
+        ).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        attn = attn1 - lambda_full * attn2
+
+        attn = self.subln(attn)
+        attn = attn * (1 - self.lambda_init)
+        # y = attn.reshape(B, T, self.n_head * 2 * self.head_dim)
         y = (
-            y.transpose(1, 2).contiguous().view_as(x)
+            attn.transpose(1, 2).contiguous().view_as(x)
         )  # re-assemble all head outputs side by side
         y = self.c_proj(y)
+        # tensors = {
+        #     "q": q.shape,
+        #     "k": k.shape,
+        #     "v": v.shape,
+        #     "v1": v1.shape,
+        #     "q1": q1.shape,
+        #     "q2": q2.shape,
+        #     "k1": k1.shape,
+        #     "k2": k2.shape,
+        #     "attn1": attn1.shape,
+        #     "attn2": attn2.shape,
+        #     "attn": attn.shape,
+        #     "y": y.shape,
+        # }
+        # print("Tensor shapes:")
+        # for name, shape in tensors.items():
+        #     print(f"{name}: {shape}")
+        # q: torch.Size([64, 1024, 12, 64])
+        # k: torch.Size([64, 1024, 12, 64])
+        # v: torch.Size([64, 1024, 6, 128])
+        # v1: torch.Size([64, 1024, 6, 128])
+        # q1: torch.Size([64, 1024, 6, 64])
+        # q2: torch.Size([64, 1024, 6, 64])
+        # k1: torch.Size([64, 1024, 6, 64])
+        # k2: torch.Size([64, 1024, 6, 64])
+        # attn1: torch.Size([64, 6, 1024, 128])
+        # attn2: torch.Size([64, 6, 1024, 128])
+        # attn: torch.Size([64, 6, 1024, 128])
+        # y: torch.Size([64, 1024, 768])
+
+        # q: torch.Size([64, 1024, 12, 64])
+        # k: torch.Size([64, 1024, 12, 64])
+        # v: torch.Size([64, 1024, 6, 128])
+        # v1: torch.Size([64, 1024, 6, 128])
+        # q1: torch.Size([64, 1024, 6, 64])
+        # q2: torch.Size([64, 1024, 6, 64])
+        # k1: torch.Size([64, 1024, 6, 64])
+        # k2: torch.Size([64, 1024, 6, 64])
+        # attn1: torch.Size([64, 6, 1024, 128])
+        # attn2: torch.Size([64, 6, 1024, 128])
+        # attn: torch.Size([64, 6, 1024, 128])
+        # y: torch.Size([64, 1024, 768])
+
         return y, v1
 
 
@@ -246,9 +327,9 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, depth):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, depth)
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
@@ -281,7 +362,9 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                h=nn.ModuleList(
+                    [Block(config, depth) for depth in range(config.n_layer)]
+                ),
             )
         )
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
